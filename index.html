@@ -134,9 +134,12 @@ input[type=range]:focus-visible{outline:2px solid var(--brass); outline-offset:3
 .moves table{width:100%; border-collapse:collapse; font-family:"JetBrains Mono",monospace; font-size:13px}
 .moves td{padding:3px 8px; vertical-align:top}
 .moves td.n{color:var(--faint); width:30px; text-align:right; user-select:none}
-.moves td.mv{width:calc(50% - 15px)}
+.moves td.mv{width:calc(50% - 15px); cursor:pointer; border-radius:5px}
+.moves td.mv:hover{color:var(--text); background:var(--brass-soft)}
+.moves td.mv.empty-cell{cursor:default}
+.moves td.mv.empty-cell:hover{background:transparent}
 .moves tr:nth-child(odd){background:rgba(255,255,255,.012)}
-.moves .last{color:var(--brass)}
+.moves .current{color:var(--brass) !important; background:var(--brass-soft) !important; box-shadow:inset 2px 0 0 var(--brass)}
 .moves .empty{color:var(--faint); padding:14px 8px; font-style:italic}
 .result{margin:8px; padding:12px 14px; border:1px solid var(--line); border-radius:10px; background:var(--panel2)}
 .result.show{border-color:var(--brass)}
@@ -191,8 +194,11 @@ footer{margin-top:26px; font-family:"JetBrains Mono",monospace; font-size:11px; 
     </div>
 
     <div class="card controls">
+      <button id="toStart" title="К началу" aria-label="К началу">⏮</button>
+      <button id="back" title="На ход назад">◀ Назад</button>
       <button class="primary" id="play">▶ Старт</button>
-      <button id="step">Шаг</button>
+      <button id="step" title="На ход вперёд">Шаг ▶</button>
+      <button id="toEnd" title="К концу" aria-label="К концу">⏭</button>
       <button id="newgame">Новая партия</button>
       <div class="speed">
         <label for="speed">Скорость</label>
@@ -623,14 +629,15 @@ const E = window.ChessEngine;
 const GLYPH = { k:"\u265A", q:"\u265B", r:"\u265C", b:"\u265D", n:"\u265E", p:"\u265F" };
 const VALUE = { p:1, n:3, b:3, r:5, q:9, k:0 };
 const FILES = ["a","b","c","d","e","f","g","h"];
-
 const REASON_RU = {
   checkmate:"мат", stalemate:"пат", insufficient:"нехватка материала",
   fifty:"правило 50 ходов", threefold:"троекратное повторение",
   adjudicated:"остановлено (нет прогресса)"
 };
 
-let state, lastMove, history, repCounts, plies, takenW, takenB, gameOver;
+// timeline: frames[i] = position after i plies. frame 0 = initial.
+// frame = { state, lastMove, takenW, takenB, san, key }
+let frames, cursor, finalStatus, counted;
 let playing = false, timer = null;
 let session = { w:0, d:0, b:0, games:0 };
 
@@ -642,156 +649,214 @@ function buildCoords(){
   $("files").innerHTML = FILES.map(f=>"<div>"+f+"</div>").join("");
 }
 
-function newGame(){
-  state = E.startState();
-  lastMove = null; history = []; repCounts = new Map();
-  plies = 0; takenW = []; takenB = []; gameOver = false;
-  pause();
-  renderAll();
-  movesEl.innerHTML = '<div class="empty">Нажмите «Старт» — агенты начнут играть.</div>';
-  $("result").className = "result hidden";
-  $("play").disabled = false; $("step").disabled = false;
-  $("play").textContent = "\u25B6 Старт";
+function mkFrame(state, lastMove, takenW, takenB, san){
+  return { state, lastMove, takenW, takenB, san, key: E.positionKey(state) };
 }
 
+function newGame(){
+  playing = false;
+  if (timer){ clearTimeout(timer); timer = null; }
+  const s = E.startState();
+  frames = [ mkFrame(s, null, [], [], null) ];
+  cursor = 0; finalStatus = null; counted = false;
+  $("result").className = "result hidden";
+  movesEl.innerHTML = '<div class="empty">Нажмите «Старт». Любой сыгранный ход можно кликнуть, чтобы перемотать к нему.</div>';
+  render();
+}
+
+const cur = () => frames[cursor];
+const atTip = () => cursor === frames.length - 1;
+const isOver = () => !!finalStatus && atTip();
+
+function repCount(idx, key){
+  let n = 0;
+  for (let i = 0; i <= idx; i++) if (frames[i].key === key) n++;
+  return n;
+}
+
+// Generate one new random move at the tip and append a frame.
+function generateAtTip(){
+  const f = cur();
+  const legal = E.legalMoves(f.state);
+  const move = legal[Math.floor(Math.random()*legal.length)];
+  const tW = f.takenW.slice(), tB = f.takenB.slice();
+  if (move.capture){
+    const cap = move.enpassant ? "p" : f.state.board[move.to.r][move.to.c].t;
+    if (f.state.turn === "w") tW.push(cap); else tB.push(cap);
+  }
+  const san = E.toSAN(f.state, move, legal);
+  const ns = E.applyMove(f.state, move);
+  frames.push(mkFrame(ns, move, tW, tB, san));
+  cursor = frames.length - 1;
+  evaluateTerminal();
+}
+
+function evaluateTerminal(){
+  const f = cur();
+  const legal = E.legalMoves(f.state);
+  const rep = repCount(cursor, f.key);
+  let st = E.status(f.state, legal, rep);
+  if (!st.over && f.state.full >= 350) st = { over:true, result:"1/2-1/2", reason:"adjudicated" };
+  if (st.over){
+    finalStatus = st;
+    if (!counted){ recordResult(st); counted = true; }
+  }
+}
+
+// Step forward: redo the existing line, or generate a new move at the tip.
+function forward(){
+  if (isOver()) return false;
+  if (!atTip()){ cursor++; render(); return true; }
+  generateAtTip(); render(); return true;
+}
+
+function back(){
+  if (cursor === 0) return;
+  pause();
+  cursor--; render();
+}
+
+function jumpTo(idx){
+  idx = Math.max(0, Math.min(frames.length - 1, idx));
+  pause();
+  cursor = idx; render();
+}
+
+function recordResult(st){
+  if (st.result === "1-0") session.w++;
+  else if (st.result === "0-1") session.b++;
+  else session.d++;
+  session.games++;
+  $("tW").textContent = session.w; $("tD").textContent = session.d; $("tB").textContent = session.b;
+  $("gamesPlayed").textContent = session.games;
+}
+
+/* ---------- rendering ---------- */
+function render(){ renderBoard(); renderAgents(); renderMeters(); renderMoves(); renderBanner(); renderButtons(); }
+
 function renderBoard(){
-  let html = "";
-  const checkColor = E.inCheck(state, state.turn) ? state.turn : null;
+  const f = cur(); const state = f.state; const lastMove = f.lastMove;
   let kingSq = null;
-  if (checkColor) kingSq = E.findKing(state.board, checkColor);
-  for (let r=0;r<8;r++){
-    for (let c=0;c<8;c++){
-      const light = (r+c)%2===0;
-      let cls = "sq " + (light?"light":"dark");
-      if (lastMove){
-        if (lastMove.from.r===r && lastMove.from.c===c) cls += " from";
-        if (lastMove.to.r===r && lastMove.to.c===c) cls += " to";
-      }
-      if (kingSq && kingSq.r===r && kingSq.c===c) cls += " check";
-      const p = state.board[r][c];
-      let inner = "";
-      if (p){
-        const land = (lastMove && lastMove.to.r===r && lastMove.to.c===c) ? " land" : "";
-        inner = '<span class="pc '+p.c+land+'">'+GLYPH[p.t]+'</span>';
-      }
-      html += '<div class="'+cls+'">'+inner+'</div>';
+  if (E.inCheck(state, state.turn)) kingSq = E.findKing(state.board, state.turn);
+  let html = "";
+  for (let r=0;r<8;r++) for (let c=0;c<8;c++){
+    const light = (r+c)%2===0;
+    let cls = "sq " + (light?"light":"dark");
+    if (lastMove){
+      if (lastMove.from.r===r && lastMove.from.c===c) cls += " from";
+      if (lastMove.to.r===r && lastMove.to.c===c) cls += " to";
     }
+    if (kingSq && kingSq.r===r && kingSq.c===c) cls += " check";
+    const p = state.board[r][c];
+    let inner = "";
+    if (p){
+      const land = (lastMove && lastMove.to.r===r && lastMove.to.c===c) ? " land" : "";
+      inner = '<span class="pc '+p.c+land+'">'+GLYPH[p.t]+'</span>';
+    }
+    html += '<div class="'+cls+'">'+inner+'</div>';
   }
   boardEl.innerHTML = html;
 }
 
 function renderAgents(){
-  $("agentW").classList.toggle("active", !gameOver && state.turn==="w");
-  $("agentB").classList.toggle("active", !gameOver && state.turn==="b");
-  // takenW = pieces white captured (black glyphs), takenB = pieces black captured (white glyphs)
-  $("takenW").innerHTML = takenW.map(t=>'<span style="color:var(--black-pc)">'+GLYPH[t]+'</span>').join("");
-  $("takenB").innerHTML = takenB.map(t=>'<span style="color:var(--white-pc)">'+GLYPH[t]+'</span>').join("");
-  const wScore = takenW.reduce((a,t)=>a+VALUE[t],0);
-  const bScore = takenB.reduce((a,t)=>a+VALUE[t],0);
+  const f = cur(); const over = isOver();
+  $("agentW").classList.toggle("active", !over && f.state.turn==="w");
+  $("agentB").classList.toggle("active", !over && f.state.turn==="b");
+  $("takenW").innerHTML = f.takenW.map(t=>'<span style="color:var(--black-pc)">'+GLYPH[t]+'</span>').join("");
+  $("takenB").innerHTML = f.takenB.map(t=>'<span style="color:var(--white-pc)">'+GLYPH[t]+'</span>').join("");
+  const wScore = f.takenW.reduce((a,t)=>a+VALUE[t],0);
+  const bScore = f.takenB.reduce((a,t)=>a+VALUE[t],0);
   const diff = wScore - bScore;
   $("advW").textContent = diff>0 ? "+"+diff : "";
   $("advB").textContent = diff<0 ? "+"+(-diff) : "";
 }
 
 function renderMeters(){
-  $("mPly").textContent = state.full;
-  $("mHalf").textContent = state.half;
-  $("fiftyBar").style.width = Math.min(100, state.half/100*100) + "%";
-  $("turnLbl").textContent = gameOver ? "партия окончена" : (state.turn==="w" ? "ход белых" : "ход чёрных");
+  const f = cur();
+  $("mPly").textContent = f.state.full;
+  $("mHalf").textContent = f.state.half;
+  $("fiftyBar").style.width = Math.min(100, f.state.half) + "%";
+  $("turnLbl").textContent = isOver() ? "партия окончена"
+    : (cursor===0 ? "ход белых" : (f.state.turn==="w" ? "ход белых" : "ход чёрных"));
 }
 
 function renderMoves(){
-  if (history.length===0) return;
+  const plies = frames.length - 1;
+  if (plies === 0) return; // keep empty hint
   let rows = "";
-  for (let i=0;i<history.length;i+=2){
-    const num = i/2 + 1;
-    const w = history[i] || "";
-    const b = history[i+1] || "";
-    const lastIdxW = (i === history.length-1);
-    const lastIdxB = (i+1 === history.length-1);
-    rows += '<tr><td class="n">'+num+'.</td>'+
-            '<td class="mv'+(lastIdxW?" last":"")+'">'+w+'</td>'+
-            '<td class="mv'+(lastIdxB?" last":"")+'">'+b+'</td></tr>';
+  for (let n=1; n <= Math.ceil(plies/2); n++){
+    const wp = 2*n - 1, bp = 2*n;
+    const wSan = frames[wp] ? frames[wp].san : "";
+    const bSan = frames[bp] ? frames[bp].san : "";
+    const wCls = "mv" + (cursor===wp ? " current" : "") + (wSan ? "" : " empty-cell");
+    const bCls = "mv" + (cursor===bp ? " current" : "") + (bSan ? "" : " empty-cell");
+    rows += '<tr><td class="n">'+n+'.</td>'+
+            '<td class="'+wCls+'" data-ply="'+wp+'">'+wSan+'</td>'+
+            '<td class="'+bCls+'" data-ply="'+bp+'">'+bSan+'</td></tr>';
   }
   movesEl.innerHTML = '<table>'+rows+'</table>';
-  movesEl.scrollTop = movesEl.scrollHeight;
+  const curCell = movesEl.querySelector('.current');
+  if (curCell) curCell.scrollIntoView({ block:"nearest" });
+  else movesEl.scrollTop = movesEl.scrollHeight;
 }
 
-function renderAll(){ renderBoard(); renderAgents(); renderMeters(); renderMoves(); }
-
-function finish(st){
-  gameOver = true; playing = false;
-  if (timer){ clearTimeout(timer); timer=null; }
+function renderBanner(){
   const r = $("result");
-  r.className = "result show";
-  $("resScore").textContent = st.result.replace("1/2","½").replace("1/2","½").replace("-","–");
-  $("resReason").textContent = "Причина: " + (REASON_RU[st.reason] || st.reason) +
-     (st.reason==="checkmate" ? " · " + (st.winner==="w"?"победили белые":"победили чёрные") : "");
-  if (st.result==="1-0") session.w++; else if (st.result==="0-1") session.b++; else session.d++;
-  session.games++;
-  $("tW").textContent=session.w; $("tD").textContent=session.d; $("tB").textContent=session.b;
-  $("gamesPlayed").textContent=session.games;
-  $("play").disabled = true; $("step").disabled = true;
-  $("play").textContent = "Готово";
-  renderAgents(); renderMeters();
-}
-
-function step(){
-  if (gameOver) return;
-  const legal = E.legalMoves(state);
-  const key = E.positionKey(state);
-  const rep = (repCounts.get(key)||0) + 1;
-  repCounts.set(key, rep);
-  let st = E.status(state, legal, rep);
-  // hard safety cap for the rare non-terminating shuffle
-  if (!st.over && state.full >= 350) st = { over:true, result:"1/2-1/2", reason:"adjudicated" };
-  if (st.over){ finish(st); return; }
-
-  const move = legal[Math.floor(Math.random()*legal.length)];
-  // record captured material before applying
-  if (move.capture){
-    let captured = move.enpassant ? "p" : state.board[move.to.r][move.to.c].t;
-    if (state.turn==="w") takenW.push(captured); else takenB.push(captured);
+  if (isOver()){
+    r.className = "result show";
+    $("resScore").textContent = finalStatus.result.split("-").map(p=>p==="1/2"?"½":p).join("–");
+    $("resReason").textContent = "Причина: " + (REASON_RU[finalStatus.reason] || finalStatus.reason) +
+      (finalStatus.reason==="checkmate" ? " · " + (finalStatus.winner==="w"?"победили белые":"победили чёрные") : "");
+  } else {
+    r.className = "result hidden";
   }
-  const san = E.toSAN(state, move, legal);
-  history.push(san);
-  state = E.applyMove(state, move);
-  lastMove = move;
-  plies++;
-  renderAll();
-
-  // check terminal for the side now to move, so the result shows immediately
-  const legal2 = E.legalMoves(state);
-  const key2 = E.positionKey(state);
-  const rep2 = (repCounts.get(key2)||0) + 1;
-  const st2 = E.status(state, legal2, rep2);
-  if (st2.over){ repCounts.set(key2, rep2); finish(st2); }
 }
 
-function tick(){
-  if (!playing) return;
-  step();
-  if (gameOver){ playing=false; $("play").textContent="Готово"; return; }
-  timer = setTimeout(tick, delayFromSlider());
+function renderButtons(){
+  const over = isOver();
+  $("back").disabled = cursor === 0;
+  $("toStart").disabled = cursor === 0;
+  $("step").disabled = over;
+  $("toEnd").disabled = atTip();
+  $("play").disabled = over;
+  $("play").textContent = playing ? "❚❚ Пауза" : (over ? "Готово" : "▶ Старт");
 }
+
+/* ---------- playback ---------- */
 function delayFromSlider(){
-  const v = +$("speed").value;            // 0..100
+  const v = +$("speed").value;                 // 0..100
   return Math.round(1200 - (1200-55) * (v/100)); // 1200ms slow -> 55ms fast
 }
+function tick(){
+  if (!playing) return;
+  if (isOver()){ stopPlay(); return; }
+  forward();
+  if (isOver()){ stopPlay(); return; }
+  timer = setTimeout(tick, delayFromSlider());
+}
 function play(){
-  if (gameOver) return;
-  playing = true; $("play").textContent = "❚❚ Пауза";
-  tick();
+  if (isOver()) return;
+  playing = true; renderButtons(); tick();
 }
-function pause(){
+function stopPlay(){
   playing = false;
-  if (timer){ clearTimeout(timer); timer=null; }
-  if (!gameOver) $("play").textContent = "\u25B6 Старт";
+  if (timer){ clearTimeout(timer); timer = null; }
+  renderButtons();
 }
+function pause(){ stopPlay(); }
 
+/* ---------- events ---------- */
 $("play").addEventListener("click", ()=> playing ? pause() : play());
-$("step").addEventListener("click", ()=>{ pause(); step(); if(gameOver){$("play").textContent="Готово";} });
+$("step").addEventListener("click", ()=>{ pause(); forward(); });
+$("back").addEventListener("click", back);
+$("toStart").addEventListener("click", ()=> jumpTo(0));
+$("toEnd").addEventListener("click", ()=> jumpTo(frames.length - 1));
 $("newgame").addEventListener("click", newGame);
+movesEl.addEventListener("click", (e)=>{
+  const td = e.target.closest("td.mv");
+  if (!td || !td.dataset.ply || td.classList.contains("empty-cell")) return;
+  jumpTo(+td.dataset.ply);
+});
 
 buildCoords();
 newGame();
